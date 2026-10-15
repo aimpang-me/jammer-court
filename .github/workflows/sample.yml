@@ -1,0 +1,52 @@
+name: Sample
+
+# Every free aircraft feed refuses requests from Cloudflare, so GitHub takes the samples (SPEC.md 4.4). Two runs per
+# 10-minute slot, at 2 and 7 minutes in: the second only asks whether the slot is done, unless GitHub dropped or delayed
+# the first. The Worker also accepts a post for the slot just ended, so a late run still counts. A slot no run reaches
+# is a gap.
+on:
+  schedule:
+    - cron: "2-59/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write # only for the daily keepalive below
+
+concurrency:
+  group: sample
+  cancel-in-progress: false
+
+jobs:
+  sample:
+    if: github.repository == 'aimpang-me/jammer-court' # forks never sample
+    runs-on: ubuntu-latest
+    timeout-minutes: 9 # a total upstream outage is about 5 minutes of timeouts; the slot must still be recorded
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # the token with actions: write is only for the keepalive step's API call
+          sparse-checkout: |
+            src
+            tools
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Take the sample and post it
+        env:
+          JC_URL: ${{ vars.JAMMER_COURT_URL || 'https://jammer-court.aimpang.workers.dev' }}
+          JC_KEY: ${{ secrets.JAMMER_COURT_INGEST_KEY || secrets.JAMMER_COURT_API_KEY }}
+        run: |
+          if [ -z "$JC_KEY" ]; then echo "::warning::Add the JAMMER_COURT_API_KEY repository secret."; exit 0; fi
+          out=$(node tools/sample.mjs)
+          echo "$out"
+          total=$(node -e 'import("./src/zones.js").then((z) => console.log(z.ZONES.length))')
+          echo "::notice::$(echo "$out" | jq -r --arg total "$total" 'if .skipped then "Slot \(.slot) was already sampled." else "Slot \(.slot): \(.ok_zones) of \($total) zones. \(.notes)" end')"
+      # GitHub turns off scheduled workflows after 60 days without repository activity; re-enabling resets that clock.
+      - name: Keep the schedule alive
+        if: always() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ "$(date -u +%H)" = "00" ] || exit 0 # any run in the midnight hour; GitHub often starts runs late
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/sample.yml/enable" && echo "Schedule kept alive."

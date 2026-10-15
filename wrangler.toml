@@ -1,0 +1,27 @@
+name = "jammer-court"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+# PUBLIC_PAGE and REPO_URL are set in the dashboard next to the API_KEY secret; this keeps them across deploys.
+keep_vars = true
+
+# Every free aircraft feed refuses requests from Cloudflare, so a GitHub Actions job takes the samples and posts them
+# to /ingest (SPEC.md 4.4). One SQLite-backed Durable Object holds every sample, event and daily score. It's on the
+# Workers free plan and needs no database to create.
+[[durable_objects.bindings]]
+name = "COURT"
+class_name = "Court"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Court"]
+
+# No cron: the Worker never wakes itself (the empty list removes the one earlier versions had).
+[triggers]
+crons = []
+
+# A KV namespace each sample writes a snapshot to, so public visitors never reach the Durable Object.
+# To run your own copy, create a namespace (Storage & Databases > KV) and paste its id here, or delete this block.
+[[kv_namespaces]]
+binding = "SNAPSHOT"
+id = "9a660bdbc3dc435c9d931a76e8ba7943"

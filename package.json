@@ -1,0 +1,20 @@
+{
+  "name": "jammer-court",
+  "version": "1.4.1",
+  "private": true,
+  "description": "Remote MCP server that watches airliners' GPS-integrity reports for jamming, answers Grok Bot and grades itself against gpsjam.org.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test && node tools/power.mjs --check && node tools/gen-cells.mjs --check",
+    "power": "node tools/power.mjs",
+    "gen-cells": "node tools/gen-cells.mjs",
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "h3-js": "^4.1.0"
+  },
+  "license": "MIT"
+}

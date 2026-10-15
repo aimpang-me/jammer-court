@@ -1,0 +1,175 @@
+name: Deploy Jammer Court
+
+# Deploys Jammer Court to Cloudflare Workers, then checks the live Worker with a real sample.
+# Needs two repository secrets (Settings > Secrets and variables > Actions):
+#   CLOUDFLARE_API_TOKEN     a Cloudflare API token made from the "Edit Cloudflare Workers" template
+#   JAMMER_COURT_API_KEY     the key Grok Bot sends (20+ characters, no spaces); set on the Worker as API_KEY
+#   JAMMER_COURT_INGEST_KEY  optional: a separate key for the sampler (20+ characters); set on the Worker as INGEST_KEY
+# Optional: CLOUDFLARE_ACCOUNT_ID, only if the token can see more than one account.
+
+on:
+  push:
+    branches: [main]
+    paths: ["src/**", "tools/sample.mjs", "wrangler.toml", "package.json", "package-lock.json", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-jammer-court
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.repository == 'aimpang-me/jammer-court' # forks never deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash # adds pipefail, so a failed deploy piped through tee still fails the step
+    env:
+      WRANGLER: npx --yes wrangler@4.149.0
+    steps:
+      # Without the secrets the run skips with a warning instead of failing, so it never turns a commit red.
+      - name: Check the secrets are set
+        id: secrets
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          API_KEY: ${{ secrets.JAMMER_COURT_API_KEY }}
+        run: |
+          missing=""
+          [ -n "$TOKEN" ] || missing="$missing CLOUDFLARE_API_TOKEN"
+          if [ "${#API_KEY}" -lt 20 ] || [[ "$API_KEY" =~ [[:space:]] ]]; then
+            missing="$missing JAMMER_COURT_API_KEY(20+ characters, no spaces)"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::warning::Not deployed. Add or fix these repository secrets, then re-run this workflow:$missing"
+            echo "Not deployed: add or fix the repository secrets:$missing" >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.secrets.outputs.ready == 'true'
+        uses: actions/checkout@v4
+      - if: steps.secrets.outputs.ready == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The Cloudflare token is not in this step's environment, and no install script runs, so nothing here can reach
+      # the deploy step.
+      - name: Test
+        if: steps.secrets.outputs.ready == 'true'
+        run: npm ci --ignore-scripts && npm test
+
+      - name: Deploy and set the API key
+        id: deploy
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          API_KEY: ${{ secrets.JAMMER_COURT_API_KEY }}
+          INGEST_KEY: ${{ secrets.JAMMER_COURT_INGEST_KEY }}
+        run: |
+          [ -z "$ACCOUNT_ID" ] || export CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID"
+          $WRANGLER deploy 2>&1 | tee deploy.log
+          url=$(grep -oE 'https://[a-z0-9.-]+\.workers\.dev' deploy.log | head -1 || true)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          printf '%s' "$API_KEY" | $WRANGLER secret put API_KEY 2>&1 | tee -a deploy.log
+          # Optional: a separate key for the sampler, so the key Grok Bot holds can't write samples.
+          if [ -n "$INGEST_KEY" ]; then printf '%s' "$INGEST_KEY" | $WRANGLER secret put INGEST_KEY 2>&1 | tee -a deploy.log; fi
+          if [ -z "$url" ]; then
+            echo "::error::Deployed, but the output has no workers.dev address (see the deploy log)."
+            exit 1
+          fi
+
+      - name: Check the live Worker
+        id: check
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+          API_KEY: ${{ secrets.JAMMER_COURT_API_KEY }}
+          INGEST_KEY: ${{ secrets.JAMMER_COURT_INGEST_KEY }}
+        run: |
+          # The key goes in a header file, not on curl's command line.
+          umask 077
+          printf 'Authorization: Bearer %s\n' "$API_KEY" > "$RUNNER_TEMP/auth"
+          get() { curl -sS --max-time 20 -H @"$RUNNER_TEMP/auth" "$@"; }
+          # /health turns configured once the new version with the key is live; allow for DNS and rollout (about 3 min).
+          for i in $(seq 1 18); do
+            health=$(get "$URL/health" || true)
+            echo "$health" | jq -e '.configured == true' > /dev/null 2>&1 && break
+            sleep 10
+          done
+          echo "health: $health"
+          echo "$health" > health.json
+          echo "$health" | jq -e '.configured == true' > /dev/null 2>&1 || { echo "::error::/health never said configured:true"; exit 1; }
+
+          # MCP answers with the key and refuses without it.
+          rpc='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+          hdrs=(-X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d "$rpc")
+          with=$(get -o /dev/null -w '%{http_code}' "${hdrs[@]}" "$URL/mcp" || true)
+          without=$(curl -sS --max-time 20 -o /dev/null -w '%{http_code}' "${hdrs[@]}" "$URL/mcp" || true)
+          echo "mcp with key: $with, without: $without"
+          if [ "$with" != 200 ] || [ "$without" != 401 ]; then
+            echo "::error::MCP auth check failed (with key $with, without $without)"
+            exit 1
+          fi
+
+          # The aircraft feeds refuse Cloudflare, so this runner takes the sample and posts it (SPEC.md 4.4).
+          # Until the new version is live, the plan request can answer 404 (first deploy) or a version mismatch, so retry
+          # those for about 2 minutes. Any other refusal won't change on a retry.
+          ok_run=false
+          for i in $(seq 1 12); do
+            if out=$(JC_URL="$URL" JC_KEY="${INGEST_KEY:-$API_KEY}" node tools/sample.mjs 2>&1); then ok_run=true; break; fi
+            echo "sampler: $out"
+            echo "$out" | grep -qE '^(plan refused: 404|version mismatch)' || break
+            [ "$i" = 12 ] || sleep 10
+          done
+          $ok_run && echo "sampler: $out"
+          $ok_run || { echo "::error::The sampler could not post a sample: $(echo "$out" | tr -d '\n' | head -c 200)"; exit 1; }
+          status=$(get "$URL/api/status.json" || true)
+          echo "$status" > status.json
+          if [ "$(echo "$out" | jq -r '.skipped // false')" = true ]; then
+            # The scheduled sampler already filled this slot; grade the stored sample and say so.
+            ok=$(echo "$status" | jq -r '.last_tick.ok_zones // 0')
+            notes="(slot already sampled) $(echo "$status" | jq -r '.last_tick.notes // ""' | tr -d '\n' | head -c 180)"
+          else
+            ok=$(echo "$out" | jq -r '.ok_zones // 0')
+            notes=$(echo "$out" | jq -r '.notes // ""' | tr -d '\n' | head -c 200)
+          fi
+          read -r total min < <(node -e 'Promise.all([import("./src/zones.js"), import("./src/config.js")]).then(([z, c]) => console.log(z.ZONES.length, c.UPTIME_MIN_ZONES))')
+          echo "zones=$total" >> "$GITHUB_OUTPUT"
+          echo "::notice::Jammer Court is live at $URL. $ok of $total zones answered. Sources: $notes"
+          # An upstream outage is reported, not a failed deploy.
+          [ "$ok" -ge "$min" ] || echo "::warning::Only $ok of $total zones answered: $notes"
+
+      # Always leaves a readable result, pass or fail, since nothing outside GitHub can see the Worker.
+      - name: Summary
+        if: always() && steps.secrets.outputs.ready == 'true'
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+          STATUS: ${{ job.status }}
+          ZONES: ${{ steps.check.outputs.zones }}
+        run: |
+          {
+            echo "### Jammer Court deploy: $STATUS"
+            echo ""
+            echo "- Address: ${URL:-none}"
+            if [ -f health.json ]; then echo "- /health: \`$(tr -d '\n`' < health.json | head -c 300)\`"; fi
+            if [ -s status.json ] && jq -e . status.json > /dev/null 2>&1; then
+              echo "- Last sample: $(jq -r '.last_tick.at // "none"' status.json), zones answered: **$(jq -r '.last_tick.ok_zones // "?"' status.json) of ${ZONES:-?}**"
+              echo "- Source codes: \`$(jq -r '.last_tick.notes // ""' status.json | tr -d '`' | head -c 300)\`"
+            fi
+            if [ -f deploy.log ]; then
+              echo ""
+              echo "<details><summary>Deploy log (last 30 lines)</summary>"
+              echo ""
+              echo '```'
+              tail -n 30 deploy.log
+              echo '```'
+              echo "</details>"
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
